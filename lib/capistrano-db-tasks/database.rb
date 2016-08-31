@@ -12,7 +12,7 @@ module Database
     end
 
     def postgresql?
-      %w(postgresql pg).include? @config['adapter']
+      %w(postgresql pg postgis).include? @config['adapter']
     end
 
     def credentials
@@ -73,7 +73,7 @@ module Database
         "mysql #{credentials} -D #{database} < #{file}"
       elsif postgresql?
         terminate_connection_sql = "SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname = '#{database}' AND pid <> pg_backend_pid();"
-        "#{pgpass} psql -c \"#{terminate_connection_sql};\" #{credentials}; #{pgpass} dropdb #{credentials} #{database}; #{pgpass} createdb #{credentials} #{database}; #{pgpass} psql #{credentials} -d #{database} < #{file}"
+        "#{pgpass} psql -c \"#{terminate_connection_sql};\" #{credentials} #{database}; #{pgpass} dropdb #{credentials} #{database}; #{pgpass} createdb #{credentials} #{database}; #{pgpass} psql #{credentials} -d #{database} < #{file}"
       end
     end
 
@@ -152,9 +152,9 @@ module Database
     # cleanup = true removes the mysqldump file after loading, false leaves it in db/
     def load(file, cleanup)
       unzip_file = File.join(File.dirname(file), File.basename(file, ".#{compressor.file_extension}"))
-      # system("bunzip2 -f #{file} && bundle exec rake db:drop db:create && #{import_cmd(unzip_file)} && bundle exec rake db:migrate")
+      # execute("bunzip2 -f #{file} && bundle exec rake db:drop db:create && #{import_cmd(unzip_file)} && bundle exec rake db:migrate")
       @cap.info "executing local: #{compressor.decompress(file)}" && #{import_cmd(unzip_file)}"
-      system("#{compressor.decompress(file)} && #{import_cmd(unzip_file)}")
+      execute("#{compressor.decompress(file)} && #{import_cmd(unzip_file)}")
       if cleanup
         @cap.info "removing #{unzip_file}"
         File.unlink(unzip_file)
@@ -165,13 +165,21 @@ module Database
     end
 
     def dump
-      system "#{dump_cmd} | #{compressor.compress('-', output_file)}"
+      execute "#{dump_cmd} | #{compressor.compress('-', output_file)}"
       self
     end
 
     def upload
       remote_file = "#{@cap.current_path}/#{output_file}"
       @cap.upload! output_file, remote_file
+    end
+
+    private
+
+    def execute(cmd)
+      result = system cmd
+      @cap.error "Failed to execute the local command: #{cmd}" unless result
+      result
     end
   end
 
