@@ -4,13 +4,14 @@ require File.expand_path("#{File.dirname(__FILE__)}/asset")
 require File.expand_path("#{File.dirname(__FILE__)}/compressors/base")
 require File.expand_path("#{File.dirname(__FILE__)}/compressors/bzip2")
 require File.expand_path("#{File.dirname(__FILE__)}/compressors/gzip")
+require File.expand_path("#{File.dirname(__FILE__)}/compressors/zstd")
 
 set :local_rails_env, ENV['RAILS_ENV'] || 'development' unless fetch(:local_rails_env)
 set :rails_env, fetch(:stage) || 'production' unless fetch(:rails_env)
 set :db_local_clean, false unless fetch(:db_local_clean)
-set :assets_dir, %w(public/system) unless fetch(:assets_dir)
-set :local_assets_dir, %w(public) unless fetch(:local_assets_dir)
-set :skip_data_sync_confirm, (ENV['SKIP_DATA_SYNC_CONFIRM'].to_s.downcase == 'true')
+set :assets_dir, 'system' unless fetch(:assets_dir)
+set :local_assets_dir, 'public' unless fetch(:local_assets_dir)
+set :skip_data_sync_confirm, ENV['SKIP_DATA_SYNC_CONFIRM'].to_s.casecmp('true').zero?
 set :disallow_pushing, false unless fetch(:disallow_pushing)
 set :compressor, :gzip unless fetch(:compressor)
 
@@ -39,6 +40,27 @@ namespace :db do
         puts "Local database: #{Database::Local.new(self).database}"
         if fetch(:skip_data_sync_confirm) || Util.prompt('Are you sure you want to erase your local database with server database')
           Database.remote_to_local(self)
+        end
+      end
+    end
+
+    desc 'Replace your local database using a dump file from the DUMP_FILE ' \
+         'environment variable'
+    task :load do
+      run_locally do
+        if ENV['DUMP_FILE'].nil?
+          raise 'You must give a dump file using the DUMP_FILE environment ' \
+                'variable'
+        end
+
+        unless File.exist?(ENV['DUMP_FILE'])
+          raise "File #{ENV['DUMP_FILE']} doesn't exists"
+        end
+
+        if fetch(:skip_data_sync_confirm) ||
+           Util.prompt('Are you sure you want to erase your local database ' \
+                       "with the dump file #{ENV['DUMP_FILE']}")
+          Database.local_to_local(self, ENV['DUMP_FILE'])
         end
       end
     end

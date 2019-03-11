@@ -1,5 +1,7 @@
 module Database
   class Base
+    DBCONFIG_BEGIN_FLAG = "__CAPISTRANODB_CONFIG_BEGIN_FLAG__".freeze
+    DBCONFIG_END_FLAG = "__CAPISTRANODB_CONFIG_END_FLAG__".freeze
 
     attr_accessor :config, :output_file
 
@@ -12,7 +14,7 @@ module Database
     end
 
     def postgresql?
-      %w(postgresql pg postgis).include? @config['adapter']
+      %w(postgresql pg postgis chronomodel).include? @config['adapter']
     end
 
     def credentials
@@ -43,7 +45,7 @@ module Database
     end
 
     def output_file
-      @output_file ||= "db/#{database}_#{current_time}.sql.#{compressor.file_extension}"
+      @output_file ||= "#{database}_#{current_time}.sql.#{compressor.file_extension}"
     end
 
     def compressor
@@ -54,7 +56,7 @@ module Database
       end
     end
 
-  private
+    private
 
     def pgpass
       @config['password'] ? "PGPASSWORD='#{@config['password']}'" : ""
@@ -88,42 +90,46 @@ module Database
     def dump_cmd_ignore_tables_opts
       ignore_tables = @cap.fetch(:db_ignore_tables, [])
       if mysql?
-        ignore_tables.map{ |t| "--ignore-table=#{database}.#{t}" }.join(" ")
+        ignore_tables.map { |t| "--ignore-table=#{database}.#{t}" }.join(" ")
       elsif postgresql?
-        ignore_tables.map{ |t| "--exclude-table=#{t}" }.join(" ")
+        ignore_tables.map { |t| "--exclude-table=#{t}" }.join(" ")
       end
     end
 
     def dump_cmd_ignore_data_tables_opts
       ignore_tables = @cap.fetch(:db_ignore_data_tables, [])
-      if postgresql?
-        ignore_tables.map{ |t| "--exclude-table-data=#{t}" }.join(" ")
-      end
+      ignore_tables.map { |t| "--exclude-table-data=#{t}" }.join(" ") if postgresql?
     end
-
   end
 
   class Remote < Base
     def initialize(cap_instance)
       super(cap_instance)
-      @config = @cap.capture("cat #{@cap.current_path}/config/database.yml")
-      @config = YAML.load(ERB.new(@config).result)[@cap.fetch(:rails_env).to_s]
+      puts "Loading remote database config"
+      @cap.within @cap.current_path do
+        @cap.with rails_env: @cap.fetch(:rails_env) do
+          dirty_config_content = @cap.capture(:rails, "runner \"puts '#{DBCONFIG_BEGIN_FLAG}' + ActiveRecord::Base.connection.instance_variable_get(:@config).to_yaml + '#{DBCONFIG_END_FLAG}'\"", '2>/dev/null')
+          # Remove all warnings, errors and artefacts produced by bunlder, rails and other useful tools
+          config_content = dirty_config_content.match(/#{DBCONFIG_BEGIN_FLAG}(.*?)#{DBCONFIG_END_FLAG}/m)[1]
+          @config = YAML.load(config_content).each_with_object({}) { |(k, v), h| h[k.to_s] = v }
+        end
+      end
     end
 
     def dump
-      @cap.execute "cd #{@cap.current_path} && #{dump_cmd} | #{compressor.compress('-', output_file)}"
+      @cap.execute "cd #{@cap.current_path} && #{dump_cmd} | #{compressor.compress('-', db_dump_file_path)}"
       self
     end
 
     def download(local_file = "#{output_file}")
-      @cap.download! dump_file_path, local_file
+      @cap.download! db_dump_file_path, local_file
     end
 
     def clean_dump_if_needed
       if @cap.fetch(:db_remote_clean)
-        @cap.execute "rm -f #{dump_file_path}"
+        @cap.execute "rm -f #{db_dump_file_path}"
       else
-        @cap.info "leaving #{dump_file_path} on the server (add \"set :db_remote_clean, true\" to deploy.rb to remove)"
+        puts "leaving #{db_dump_file_path} on the server (add \"set :db_remote_clean, true\" to deploy.rb to remove)"
       end
     end
 
@@ -137,31 +143,40 @@ module Database
 
     private
 
-    def dump_file_path
-      "#{@cap.current_path}/#{output_file}"
+    def db_dump_file_path
+      "#{db_dump_dir}/#{output_file}"
+    end
+
+    def db_dump_dir
+      @cap.fetch(:db_dump_dir) || "#{@cap.current_path}/db"
     end
   end
 
   class Local < Base
     def initialize(cap_instance)
       super(cap_instance)
-      @config = YAML.load(ERB.new(File.read(File.join('config', 'database.yml'))).result)[fetch(:local_rails_env).to_s]
-      puts "local #{@config}"
+      puts "Loading local database config"
+      dir_with_escaped_spaces = Dir.pwd.gsub ' ', '\ '
+      command = "#{dir_with_escaped_spaces}/bin/rails runner \"puts '#{DBCONFIG_BEGIN_FLAG}' + ActiveRecord::Base.connection.instance_variable_get(:@config).to_yaml + '#{DBCONFIG_END_FLAG}'\""
+      stdout, status = Open3.capture2(command)
+      raise "Error running command (status=#{status}): #{command}" if status != 0
+
+      config_content = stdout.match(/#{DBCONFIG_BEGIN_FLAG}(.*?)#{DBCONFIG_END_FLAG}/m)[1]
+      @config = YAML.load(config_content).each_with_object({}) { |(k, v), h| h[k.to_s] = v }
     end
 
     # cleanup = true removes the mysqldump file after loading, false leaves it in db/
     def load(file, cleanup)
       unzip_file = File.join(File.dirname(file), File.basename(file, ".#{compressor.file_extension}"))
-      # execute("bunzip2 -f #{file} && bundle exec rake db:drop db:create && #{import_cmd(unzip_file)} && bundle exec rake db:migrate")
-      @cap.info "executing local: #{compressor.decompress(file)}" && #{import_cmd(unzip_file)}"
+      puts "executing local: #{compressor.decompress(file)} && #{import_cmd(unzip_file)}"
       execute("#{compressor.decompress(file)} && #{import_cmd(unzip_file)}")
       if cleanup
-        @cap.info "removing #{unzip_file}"
+        puts "removing #{unzip_file}"
         File.unlink(unzip_file)
       else
-        @cap.info "leaving #{unzip_file} (specify :db_local_clean in deploy.rb to remove)"
+        puts "leaving #{unzip_file} (specify :db_local_clean in deploy.rb to remove)"
       end
-      @cap.info "Completed database import"
+      puts "Completed database import"
     end
 
     def dump
@@ -183,12 +198,21 @@ module Database
     end
   end
 
-
   class << self
-    def check(local_db, remote_db)
-      unless (local_db.mysql? && remote_db.mysql?) || (local_db.postgresql? && remote_db.postgresql?)
-        raise 'Only mysql or postgresql on remote and local server is supported'
-      end
+    def check(local_db, remote_db = nil)
+      return if mysql_db_valid?(local_db, remote_db)
+      return if postgresql_db_valid?(local_db, remote_db)
+
+      raise 'Only mysql or postgresql on remote and local server is supported'
+    end
+
+    def mysql_db_valid?(local_db, remote_db)
+      local_db.mysql? && (remote_db.nil? || remote_db && remote_db.mysql?)
+    end
+
+    def postgresql_db_valid?(local_db, remote_db)
+      local_db.postgresql? &&
+        (remote_db.nil? || (remote_db && remote_db.postgresql?))
     end
 
     def remote_to_local(instance)
@@ -215,6 +239,13 @@ module Database
       remote_db.load(local_db.output_file, instance.fetch(:db_local_clean))
       File.unlink(local_db.output_file) if instance.fetch(:db_local_clean)
     end
-  end
 
+    def local_to_local(instance, dump_file)
+      local_db = Database::Local.new(instance)
+
+      check(local_db)
+
+      local_db.load(dump_file, instance.fetch(:db_local_clean))
+    end
+  end
 end
