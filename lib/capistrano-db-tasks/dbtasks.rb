@@ -91,7 +91,7 @@ namespace :assets do
     desc 'Synchronize your local assets using remote assets'
     task :sync do
       on roles(:app) do
-        puts "Remote assets directories: #{self.shared_path}/#{fetch(:assets_dir).join('/')}"
+        puts "Remote assets directories: #{self.shared_path}/#{fetch(:assets_dir).join(', ')}"
         puts "Local assets directories: #{fetch(:local_assets_dir).join(', ')}"
         if fetch(:skip_data_sync_confirm) || Util.prompt("Are you sure you want to erase your local assets with server assets")
           Asset.remote_to_local(self)
